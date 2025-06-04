@@ -5,12 +5,11 @@ A secure file storage system built with Express.js that implements file chunking
 ## Features
 
 - Secure file upload with chunking (1MB chunks by default)
-- File encryption using AES-256-CBC
-- Streaming file downloads
-- User authentication with JWT
+- File encryption using AES-256-CBC with unique IV per chunk
+- Streaming file downloads with chunk-by-chunk decryption
 - JSON-based file metadata storage
-- Rate limiting and security headers
 - File listing and management
+- Secure file deletion with chunk cleanup
 
 ## Prerequisites
 
@@ -33,7 +32,6 @@ npm install
 3. Create a `.env` file in the root directory with the following variables:
 ```
 PORT=3000
-JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
 CHUNK_SIZE=1048576 # 1MB chunks
 UPLOAD_DIR=uploads
 ENCRYPTION_KEY=your-encryption-key-change-this-in-production
@@ -53,43 +51,61 @@ npm run dev
 
 ## API Endpoints
 
-### Authentication
-
-- `POST /api/auth/register` - Register a new user
-  - Body: `{ "username": "string", "password": "string" }`
-  - Returns: JWT token
-
-- `POST /api/auth/login` - Login user
-  - Body: `{ "username": "string", "password": "string" }`
-  - Returns: JWT token
-
 ### Files
 
 - `POST /api/files/upload` - Upload a file
-  - Headers: `Authorization: Bearer <token>`
   - Body: Form data with `file` field
-  - Returns: File ID
+  - Returns: `{ message: string, fileId: string }`
+  - Process:
+    1. File is received and temporarily stored
+    2. File is split into chunks (1MB by default)
+    3. Each chunk is encrypted with AES-256-CBC and unique IV
+    4. Chunks are stored in a dedicated directory
+    5. File metadata is saved to JSON database
 
 - `GET /api/files/download/:fileId` - Download a file
-  - Headers: `Authorization: Bearer <token>`
-  - Returns: File stream
+  - Returns: File stream with proper headers
+  - Process:
+    1. Retrieves file metadata
+    2. Streams each chunk
+    3. Decrypts chunks on-the-fly
+    4. Sends decrypted data to client
 
-- `GET /api/files/list` - List user's files
-  - Headers: `Authorization: Bearer <token>`
-  - Returns: Array of file metadata
+- `GET /api/files/list` - List all files
+  - Returns: Array of file metadata objects
+  - Each file object contains:
+    - id: string
+    - originalName: string
+    - size: number
+    - mimeType: string
+    - uploadedAt: string (ISO date)
 
 - `DELETE /api/files/:fileId` - Delete a file
-  - Headers: `Authorization: Bearer <token>`
   - Returns: Success message
+  - Process:
+    1. Removes all encrypted chunks
+    2. Deletes chunk directory
+    3. Removes file metadata
 
 ## Security Features
 
-- File encryption using AES-256-CBC
-- JWT-based authentication
-- Rate limiting
-- Security headers (Helmet)
-- File chunking for large files
-- Secure file deletion
+- File Encryption:
+  - AES-256-CBC encryption for each file chunk
+  - Unique Initialization Vector (IV) per chunk
+  - Secure key derivation using SHA-256
+  - Legacy encryption support for backward compatibility
+
+- File Storage:
+  - Files are split into manageable chunks (1MB by default)
+  - Original files are immediately deleted after chunking
+  - Each file's chunks are stored in a dedicated directory
+  - Secure file deletion with complete chunk cleanup
+
+- Data Management:
+  - JSON-based metadata storage
+  - Atomic file operations
+  - Proper error handling and logging
+  - File existence verification
 
 ## Project Structure
 
@@ -97,26 +113,32 @@ npm run dev
 expressjs-secure-file-storage/
 ├── src/
 │   ├── app.js              # Main application file
-│   ├── middleware/
-│   │   └── auth.js         # Authentication middleware
-│   └── routes/
-│       ├── auth.js         # Authentication routes
-│       └── files.js        # File handling routes
+│   ├── routes/
+│   │   └── files.js        # File handling routes
+│   └── data/
+│       └── files.json      # File metadata storage
 ├── uploads/                # File storage directory
-├── data/                   # JSON database files
-├── .env                    # Environment variables
+│   └── [file-id]/         # Individual file chunk directories
+│       ├── chunk-0        # Encrypted file chunks
+│       ├── chunk-1
+│       └── ...
+├── .env                   # Environment variables
 ├── package.json
 └── README.md
 ```
 
 ## Security Considerations
 
-1. Change the default JWT secret and encryption key in production
+1. Change the default encryption key in production
 2. Implement proper error handling and logging
 3. Consider using a proper database for production use
 4. Implement file type validation
 5. Add file size limits
 6. Implement proper backup strategies
+7. Consider implementing user authentication for production use
+8. Monitor disk space usage
+9. Implement rate limiting for API endpoints
+10. Add request validation
 
 ## License
 

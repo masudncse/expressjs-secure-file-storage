@@ -4,10 +4,10 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
 const fs = require('fs');
+const net = require('net');
 
 // Import routes
 const fileRoutes = require('./routes/files');
-const authMiddleware = require('./middleware/auth');
 
 const app = express();
 
@@ -30,7 +30,7 @@ const limiter = rateLimit({
 app.use(limiter);
 
 // Routes
-app.use('/api/files', authMiddleware, fileRoutes);
+app.use('/api/files', fileRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -42,6 +42,32 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+
+// Function to find an available port
+async function findAvailablePort(startPort) {
+    return new Promise((resolve, reject) => {
+        const server = net.createServer();
+        server.unref();
+        server.on('error', (err) => {
+            if (err.code === 'EADDRINUSE') {
+                resolve(findAvailablePort(startPort + 1));
+            } else {
+                reject(err);
+            }
+        });
+        server.listen(startPort, () => {
+            server.close(() => {
+                resolve(startPort);
+            });
+        });
+    });
+}
+
+// Start server with port fallback
+findAvailablePort(PORT).then(port => {
+    app.listen(port, () => {
+        console.log(`Server is running on http://localhost:${port}`);
+    });
+}).catch(err => {
+    console.error('Failed to start server:', err);
 }); 

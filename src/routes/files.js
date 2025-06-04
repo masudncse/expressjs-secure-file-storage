@@ -32,16 +32,73 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
+// Helper function to generate IV
+function generateIV() {
+    return crypto.randomBytes(16);
+}
+
+// Helper function to get encryption key
+function getKey(key) {
+    // Create a consistent 32-byte key using SHA-256
+    return crypto.createHash('sha256').update(key).digest();
+}
+
 // Helper function to encrypt file chunks
 function encryptChunk(chunk, key) {
-    const cipher = crypto.createCipher('aes-256-cbc', key);
-    return Buffer.concat([cipher.update(chunk), cipher.final()]);
+    try {
+        // Use new encryption method with IV
+        const iv = generateIV();
+        const cipher = crypto.createCipheriv('aes-256-cbc', getKey(key), iv);
+        const encrypted = Buffer.concat([cipher.update(chunk), cipher.final()]);
+        // Store IV with encrypted data and add a marker to indicate new encryption method
+        return Buffer.concat([Buffer.from([1]), iv, encrypted]); // 1 indicates new method
+    } catch (error) {
+        console.error('Encryption error:', error);
+        throw new Error(`Failed to encrypt chunk: ${error.message}`);
+    }
 }
 
 // Helper function to decrypt file chunks
 function decryptChunk(chunk, key) {
-    const decipher = crypto.createDecipher('aes-256-cbc', key);
-    return Buffer.concat([decipher.update(chunk), decipher.final()]);
+    try {
+        if (!Buffer.isBuffer(chunk)) {
+            throw new Error('Chunk must be a Buffer');
+        }
+
+        if (chunk.length === 0) {
+            throw new Error('Empty chunk received');
+        }
+
+        // Check if it's using new encryption method (has marker byte)
+        if (chunk[0] === 1) {
+            if (chunk.length < 18) { // 1 byte marker + 16 bytes IV + at least 1 byte data
+                throw new Error('Chunk too small for new encryption format');
+            }
+            // New method: [marker(1)][iv(16)][encrypted data]
+            const iv = chunk.slice(1, 17);
+            const encryptedData = chunk.slice(17);
+            const decipher = crypto.createDecipheriv('aes-256-cbc', getKey(key), iv);
+            return Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+        } else {
+            // Old method: legacy decryption
+            try {
+                const decipher = crypto.createDecipher('aes-256-cbc', key);
+                return Buffer.concat([decipher.update(chunk), decipher.final()]);
+            } catch (legacyError) {
+                console.error('Legacy decryption failed:', legacyError);
+                // If legacy decryption fails, try with the hashed key
+                const decipher = crypto.createDecipher('aes-256-cbc', getKey(key).toString('hex'));
+                return Buffer.concat([decipher.update(chunk), decipher.final()]);
+            }
+        }
+    } catch (error) {
+        console.error('Decryption error details:', {
+            chunkLength: chunk.length,
+            firstBytes: chunk.slice(0, 5).toString('hex'),
+            error: error.message
+        });
+        throw new Error(`Failed to decrypt chunk: ${error.message}`);
+    }
 }
 
 // Upload file with chunking
@@ -89,7 +146,6 @@ router.post('/upload', upload.single('file'), async (req, res) => {
             size: fileStats.size,
             mimeType: req.file.mimetype,
             chunks: chunks,
-            uploadedBy: req.user.id,
             uploadedAt: new Date().toISOString()
         };
 
@@ -108,65 +164,114 @@ router.post('/upload', upload.single('file'), async (req, res) => {
 
 // Stream file download
 router.get('/download/:fileId', async (req, res) => {
+    let fileHandle;
     try {
         const fileData = JSON.parse(await fs.readFile(DB_PATH, 'utf8'));
         const file = fileData.files.find(f => f.id === req.params.fileId);
 
         if (!file) {
+            console.error(`File not found with ID: ${req.params.fileId}`);
             return res.status(404).json({ error: 'File not found' });
         }
+
+        console.log('=== Download Debug Info ===');
+        console.log(`File: ${file.originalName}`);
+        console.log(`Total size: ${file.size} bytes`);
+        console.log(`Total chunks: ${file.chunks.length}`);
+        console.log(`Chunk paths:`, file.chunks);
 
         // Set headers for streaming
         res.setHeader('Content-Type', file.mimeType);
         res.setHeader('Content-Disposition', `attachment; filename="${file.originalName}"`);
         res.setHeader('Content-Length', file.size);
 
-        // Create a transform stream for decryption
-        const decryptStream = new (require('stream').Transform)({
-            transform(chunk, encoding, callback) {
-                try {
-                    const decrypted = decryptChunk(chunk, process.env.ENCRYPTION_KEY || 'default-key');
-                    callback(null, decrypted);
-                } catch (error) {
-                    callback(error);
-                }
+        // Handle client disconnect
+        req.on('close', () => {
+            console.log('[Download] Client disconnected during download');
+            if (fileHandle) {
+                fileHandle.close().catch(err => console.error('[Download] Error closing file handle:', err));
             }
         });
 
-        // Pipe each chunk through the decrypt stream
-        for (const chunkPath of file.chunks) {
-            const chunkStream = fsSync.createReadStream(chunkPath);
-            await new Promise((resolve, reject) => {
-                chunkStream
-                    .pipe(decryptStream)
-                    .pipe(res, { end: false })
-                    .on('error', reject)
-                    .on('finish', resolve);
-            });
+        // Process each chunk
+        for (let i = 0; i < file.chunks.length; i++) {
+            const chunkPath = file.chunks[i];
+            console.log(`[Download] Processing chunk ${i + 1}/${file.chunks.length}: ${chunkPath}`);
+            
+            try {
+                // Verify chunk exists and get its size
+                const chunkStats = await fs.stat(chunkPath);
+                console.log(`[Download] Chunk ${i + 1} size: ${chunkStats.size} bytes`);
+                
+                if (chunkStats.size === 0) {
+                    throw new Error(`Chunk ${i + 1} is empty`);
+                }
+
+                if (!fsSync.existsSync(chunkPath)) {
+                    throw new Error(`Chunk file does not exist: ${chunkPath}`);
+                }
+
+                // Read the entire chunk file
+                const encryptedChunk = await fs.readFile(chunkPath);
+                console.log(`[Download] Read chunk ${i + 1}, size: ${encryptedChunk.length} bytes`);
+
+                // Decrypt the entire chunk at once
+                const decryptedChunk = decryptChunk(encryptedChunk, process.env.ENCRYPTION_KEY || 'default-key');
+                console.log(`[Download] Decrypted chunk ${i + 1}, size: ${decryptedChunk.length} bytes`);
+
+                // Write the decrypted chunk to the response
+                res.write(decryptedChunk);
+                console.log(`[Download] Wrote chunk ${i + 1} to response`);
+
+            } catch (error) {
+                console.error(`[Download] Failed to process chunk ${i + 1}:`, {
+                    error: error.message,
+                    stack: error.stack,
+                    chunkPath,
+                    chunkNumber: i + 1
+                });
+                throw error;
+            }
         }
 
+        console.log('[Download] All chunks processed successfully');
         res.end();
     } catch (error) {
-        console.error('Download error:', error);
-        res.status(500).json({ error: 'Error downloading file' });
+        console.error('[Download] Download failed:', {
+            error: error.message,
+            stack: error.stack,
+            fileId: req.params.fileId
+        });
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                error: 'Download failed',
+                message: process.env.NODE_ENV === 'development' ? error.message : 'Failed to download file'
+            });
+        }
+    } finally {
+        if (fileHandle) {
+            try {
+                await fileHandle.close();
+            } catch (err) {
+                console.error('[Download] Error closing file handle in finally block:', err);
+            }
+        }
     }
 });
 
-// List user's files
+// List all files
 router.get('/list', async (req, res) => {
     try {
         const fileData = JSON.parse(await fs.readFile(DB_PATH, 'utf8'));
-        const userFiles = fileData.files
-            .filter(f => f.uploadedBy === req.user.id)
-            .map(({ id, originalName, size, mimeType, uploadedAt }) => ({
-                id,
-                originalName,
-                size,
-                mimeType,
-                uploadedAt
-            }));
+        const files = fileData.files.map(({ id, originalName, size, mimeType, uploadedAt }) => ({
+            id,
+            originalName,
+            size,
+            mimeType,
+            uploadedAt
+        }));
         
-        res.json(userFiles);
+        res.json(files);
     } catch (error) {
         console.error('List files error:', error);
         res.status(500).json({ error: 'Error listing files' });
@@ -184,9 +289,6 @@ router.delete('/:fileId', async (req, res) => {
         }
 
         const file = fileData.files[fileIndex];
-        if (file.uploadedBy !== req.user.id) {
-            return res.status(403).json({ error: 'Not authorized to delete this file' });
-        }
 
         // Delete all chunks
         const chunksDir = path.dirname(file.chunks[0]);
